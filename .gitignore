@@ -1,0 +1,74 @@
+# Byte-compiled / optimized / C-extensions
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+
+# Environment Variables & Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating System
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test Output, Intermediate Logs & Benchmark Dumps
+*.log
+locust_*_stats*.csv
+locust_*_failures.csv
+locust_*_exceptions.csv
+latency_distribution_export.json
+scratch/*.log
+scratch/*.csv
+scratch/*.json
+scratch/*.flag
+benchmarks/*.log
+benchmarks/*.csv
+benchmarks/*.json
+
+# Local SQLite databases (if used)
+*.db
+*.sqlite3
