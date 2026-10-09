@@ -104,15 +104,19 @@ Sustained throughput (steady-state, saturated-queue measurement on a Windows + D
 ### 1. Clone & Setup Environment
 
 ```bash
-# Clone repository
-git clone <repo-url>
-cd "Distributed Notification Engine"
+# Clone the repository
+git clone https://github.com/Lithinpavansai/Distributed-Notification-Engine.git
+cd Distributed-Notification-Engine
 
-# Create and activate a virtual environment
+# Create a virtual environment
 python -m venv .venv
-# On Windows:
-.venv\Scripts\activate
-# On Linux/macOS:
+
+# Activate the virtual environment
+# On Windows (PowerShell):
+.venv\Scripts\Activate.ps1
+# On Windows (CMD):
+.venv\Scripts\activate.bat
+# On Linux / macOS:
 source .venv/bin/activate
 
 # Install dependencies
@@ -121,8 +125,19 @@ pip install -r requirements.txt
 
 ### 2. Configure Environment Variables
 
-Copy `.env.example` to `.env`:
+Create your local `.env` file by copying `.env.example`:
 
+**On Windows (PowerShell):**
+```powershell
+Copy-Item .env.example .env
+```
+
+**On Windows (CMD):**
+```cmd
+copy .env.example .env
+```
+
+**On Linux / macOS:**
 ```bash
 cp .env.example .env
 ```
@@ -144,7 +159,7 @@ REDIS_URL=redis://localhost:6379/0
 
 ### 3. Start Infrastructure with Docker Compose
 
-Launch PostgreSQL and Redis:
+Launch PostgreSQL 16 and Redis 7 containers in detached mode:
 
 ```bash
 docker compose up -d
@@ -152,7 +167,7 @@ docker compose up -d
 
 ### 4. Run Database Migrations
 
-Apply table definitions and defaults for the Dead Letter Queue:
+Apply table definitions and verify default values for the Dead Letter Queue (DLQ):
 
 ```bash
 python -m app.migrate
