@@ -5,10 +5,17 @@ import asyncio
 import uuid
 import random
 import csv
+import logging
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
-from fastapi import FastAPI, Depends, HTTPException, Security, Header
+from pathlib import Path
 from typing import Optional
+from dotenv import load_dotenv
+
+# Ensure environment variables are loaded immediately upon import
+load_dotenv()
+
+from fastapi import FastAPI, Depends, HTTPException, Security, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from datetime import datetime
@@ -16,13 +23,36 @@ from redis.asyncio import Redis
 from arq import create_pool
 from arq.connections import RedisSettings
 
-# TODO: AVG_JOB_PROCESS_SECONDS needs real empirical measurement in production.
-# Currently stubbed as a default configuration value of 5.0.
-AVG_JOB_PROCESS_SECONDS = float(os.getenv("AVG_JOB_PROCESS_SECONDS", "5.0"))
+logger = logging.getLogger("notification_engine")
 
-# Rate limit configuration
+# Base directory for portable log and scratch paths
+BASE_DIR = Path(__file__).resolve().parent.parent
+LOG_DIR = Path(os.getenv("LOG_DIR", str(BASE_DIR / "logs")))
+SCRATCH_DIR = Path(os.getenv("SCRATCH_DIR", str(BASE_DIR / "scratch")))
+TIMING_LOG_PATH = LOG_DIR / "timing.log"
+INGESTION_TIMING_LOG = SCRATCH_DIR / "ingestion_timing.log"
+JOB_EXEC_TIMING_LOG = SCRATCH_DIR / "job_execution_timing.log"
+REDIS_CALL_LATENCY_LOG = SCRATCH_DIR / "redis_call_latencies.log"
+
+# Default configuration values
+AVG_JOB_PROCESS_SECONDS = float(os.getenv("AVG_JOB_PROCESS_SECONDS", "5.0"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "5"))
+
+def get_database_url(for_sqlalchemy: bool = False) -> str:
+    """
+    Returns normalized database connection string.
+    asyncpg requires 'postgresql://', SQLAlchemy async engine requires 'postgresql+asyncpg://'.
+    """
+    url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/notification_db")
+    if for_sqlalchemy:
+        if not url.startswith("postgresql+asyncpg://") and url.startswith("postgresql://"):
+            return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return url
+    else:
+        if url.startswith("postgresql+asyncpg://"):
+            return url.replace("postgresql+asyncpg://", "postgresql://", 1)
+        return url
 
 # Sorted Set (zset) Sliding Window Rate Limit Lua Script
 RATE_LIMIT_LUA = """
@@ -87,25 +117,47 @@ RECONCILE_LATENCY_KEY = "metrics:reconcile_latency_ms"
 RECONCILE_LATENCY_SAMPLE_CAP = 1000
 RECONCILE_TTL_MIN_SAMPLES = 500
 
-# Simple custom class for job context matching ARQ job style
 class NotificationJob:
+    """Job context matching ARQ job style."""
     def __init__(self, idempotency_key: str, payload: dict):
         self.idempotency_key = idempotency_key
         self.payload = payload
         self.requeued = False
         self.requeue_reason = None
         self.final_status = None
+        self.contention_requeue_count = 0
+        self.replay_count = 0
+        self.ctx = None
+        self.last_delay = 0.0
 
-# Transient Gateway Exception
 class TransientGatewayError(Exception):
+    """Exception raised for transient, retryable delivery errors."""
     pass
 
-# Stub classes for GatewayMock
 class GatewayStatus:
     def __init__(self, was_received: bool):
         self.was_received = was_received
 
-class GatewayMock:
+class BaseNotificationGateway:
+    """Abstract base class for notification delivery providers (e.g. SMTP, Push, Webhook)."""
+    async def send(self, idempotency_key: str, payload: dict) -> dict:
+        raise NotImplementedError
+
+    async def check_status(self, idempotency_key: str) -> GatewayStatus:
+        raise NotImplementedError
+
+# Global Mock variables for test configuration
+GATEWAY_SEND_DELAY = float(os.getenv("GATEWAY_SEND_DELAY", "0.0"))
+GATEWAY_SEND_EVENT = None
+GATEWAY_START_EVENT = None
+GATEWAY_FORCE_TRANSIENT_ERROR = False
+GATEWAY_CALL_COUNT = 0
+
+class MockGatewayAdapter(BaseNotificationGateway):
+    """
+    Deterministic development and test delivery adapter.
+    Simulates external notification delivery with configurable delays, event triggers, and transient failures.
+    """
     def __init__(self):
         self.delay = 0.0
         self.was_received_map = {}
@@ -116,50 +168,41 @@ class GatewayMock:
         was_received = self.was_received_map.get(idempotency_key, False)
         return GatewayStatus(was_received=was_received)
 
-# Global Mock gateway instance
-gateway_mock = GatewayMock()
+    async def send(self, idempotency_key: str, payload: dict) -> dict:
+        global GATEWAY_CALL_COUNT
+        GATEWAY_CALL_COUNT += 1
+        
+        if GATEWAY_SEND_DELAY > 0:
+            await asyncio.sleep(GATEWAY_SEND_DELAY)
+            
+        if GATEWAY_START_EVENT is not None:
+            GATEWAY_START_EVENT.set()
+            
+        if GATEWAY_SEND_EVENT is not None:
+            await GATEWAY_SEND_EVENT.wait()
+            
+        if GATEWAY_FORCE_TRANSIENT_ERROR:
+            raise TransientGatewayError("Transient gateway error (forced)")
+            
+        self.was_received_map[idempotency_key] = True
+        return {"status": "success", "idempotency_key": idempotency_key}
 
-# Global Mock variables for test configuration
-GATEWAY_SEND_DELAY = float(os.getenv("GATEWAY_SEND_DELAY", "0.0"))
-GATEWAY_SEND_EVENT = None
-GATEWAY_START_EVENT = None
-GATEWAY_FORCE_TRANSIENT_ERROR = False
-GATEWAY_CALL_COUNT = 0
+# Global gateway instance (using Mock adapter for local/test environments)
+gateway_mock = MockGatewayAdapter()
 
 async def call_gateway_mock(idempotency_key: str, payload: dict) -> dict:
-    global GATEWAY_CALL_COUNT
-    GATEWAY_CALL_COUNT += 1
-    
-    if GATEWAY_SEND_DELAY > 0:
-        await asyncio.sleep(GATEWAY_SEND_DELAY)
-        
-    if GATEWAY_START_EVENT is not None:
-        GATEWAY_START_EVENT.set()
-        
-    if GATEWAY_SEND_EVENT is not None:
-        await GATEWAY_SEND_EVENT.wait()
-        
-    if GATEWAY_FORCE_TRANSIENT_ERROR:
-        raise TransientGatewayError("Transient gateway error (forced)")
-        
-    gateway_mock.was_received_map[idempotency_key] = True
-    return {"status": "success", "idempotency_key": idempotency_key}
+    return await gateway_mock.send(idempotency_key, payload)
 
 async def finalize_job_status(job, status: str):
-    import logging
-    logger = logging.getLogger("worker")
-    logger.info(f"Finalizing job {job.idempotency_key} with status: {status}")
+    worker_logger = logging.getLogger("worker")
+    worker_logger.info("Finalizing job %s with status: %s", job.idempotency_key, status)
     job.final_status = status
 
 CONTENTION_MAX_ATTEMPTS = 5
 
 async def insert_dead_letter_queue_row(job, stack_trace: str, replay_count: int):
     import asyncpg
-    import json
-    db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/notification_db")
-    if "postgresql+asyncpg://" in db_url:
-        db_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
-    
+    db_url = get_database_url()
     conn = await asyncpg.connect(db_url)
     try:
         payload_json = json.dumps(job.payload)
@@ -199,7 +242,6 @@ async def requeue_with_backoff(job, reason: str):
     job.requeue_reason = reason
     job.last_delay = delay
 
-# Minimal stubs for NotificationIn, get_current_user, and job_queue
 class NotificationIn(BaseModel):
     idempotency_key: str
     title: str = "Test"
@@ -241,7 +283,7 @@ _timing_buffer = []
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis, arq_pool, db_pool
-    # Startup: ensure redis and arq pool are initialized
+    # Startup: ensure redis, arq pool, and database connection pool are initialized
     redis = Redis.from_url(redis_url, max_connections=200)
     parsed = urlparse(redis_url)
     host = parsed.hostname or 'localhost'
@@ -253,10 +295,12 @@ async def lifespan(app: FastAPI):
     
     # Initialize Postgres db_pool
     import asyncpg
-    db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/notification_db")
-    if "postgresql+asyncpg://" in db_url:
-        db_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
-    db_pool = await asyncpg.create_pool(db_url)
+    db_url = get_database_url()
+    try:
+        db_pool = await asyncpg.create_pool(db_url)
+    except Exception as exc:
+        logger.warning("Could not initialize database connection pool in lifespan: %s", exc)
+        db_pool = None
     
     yield
     
@@ -268,9 +312,13 @@ async def lifespan(app: FastAPI):
         await db_pool.close()
 
     if _timing_buffer:
-        with open("c:/Users/lithe/Downloads/Distributed Notification Engine/timing.log", "a") as f:
-            for msg in _timing_buffer:
-                f.write(msg + "\n")
+        try:
+            TIMING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(TIMING_LOG_PATH, "a") as f:
+                for msg in _timing_buffer:
+                    f.write(msg + "\n")
+        except Exception:
+            pass
 
 app = FastAPI(
     title="Distributed Notification Engine",
@@ -279,11 +327,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-INGESTION_TIMING_LOG = "c:/Users/lithe/Downloads/Distributed Notification Engine/scratch/ingestion_timing.log"
 _ingestion_log_initialised = False
 
 def _write_ingestion_timing(row: dict):
-    """Append one timing row to ingestion_timing.log (CSV)."""
+    """Append one timing row to ingestion_timing.log (CSV) defensively."""
     global _ingestion_log_initialised
     fieldnames = [
         "ts", "source", "status_code",
@@ -292,34 +339,30 @@ def _write_ingestion_timing(row: dict):
         "t_post_lua_ms",   # time after lua until response dispatched (incr + redis.get OR arq.enqueue)
         "t_total_ms",      # end-to-end handler time
     ]
-    write_header = not _ingestion_log_initialised
-    if write_header:
-        os.makedirs(os.path.dirname(INGESTION_TIMING_LOG), exist_ok=True)
-    with open(INGESTION_TIMING_LOG, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
-    _ingestion_log_initialised = True
-
+    try:
+        write_header = not _ingestion_log_initialised
+        INGESTION_TIMING_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(INGESTION_TIMING_LOG, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+        _ingestion_log_initialised = True
+    except Exception as e:
+        logger.debug("Failed writing ingestion timing: %s", e)
 
 @app.get("/health", status_code=200)
 async def health_check():
-    """
-    Health check endpoint to verify that the application boots and runs.
-    """
+    """Health check endpoint to verify that the application boots and runs."""
     return {"status": "ok"}
-
 
 def make_idempotency_key(user_id: str, idempotency_key: str) -> str:
     return f"idempotency:{user_id}:{idempotency_key}"
 
-
 async def get_ingestion_lock_ttl(queue) -> int:
     depth = await queue.get_depth()
-    estimated_drain_seconds = depth * AVG_JOB_PROCESS_SECONDS  # measure empirically
+    estimated_drain_seconds = depth * AVG_JOB_PROCESS_SECONDS
     return max(60, min(estimated_drain_seconds + 30, 900))  # floor 60s, cap 15min
-
 
 async def handle_existing_idempotency_key(key: str):
     """
@@ -336,7 +379,7 @@ async def handle_existing_idempotency_key(key: str):
             detail="Idempotency key state expired mid-request; retry.",
         )
 
-    if value == b"PROCESSING":
+    if value == b"PROCESSING" or value == "PROCESSING":
         return JSONResponse(
             status_code=202,
             content={"status": "processing", "detail": "Request accepted, not yet complete."},
@@ -348,26 +391,32 @@ async def handle_existing_idempotency_key(key: str):
     except (json.JSONDecodeError, TypeError):
         raise HTTPException(status_code=500, detail="Corrupted idempotency state for key.")
 
+    return JSONResponse(
+        status_code=cached.get("status_code", 200),
+        content=cached.get("body", cached),
+    )
+
 _job_exec_log_file = None
 
 def _record_job_exec_timing(duration_ms: float, key_type: str = "unique"):
     global _job_exec_log_file
-    if _job_exec_log_file is None:
-        os.makedirs("c:/Users/lithe/Downloads/Distributed Notification Engine/scratch", exist_ok=True)
-        _job_exec_log_file = open(
-            "c:/Users/lithe/Downloads/Distributed Notification Engine/scratch/job_execution_timing.log",
-            "a",
-            buffering=1
-        )
-    _job_exec_log_file.write(f"{key_type},{duration_ms:.3f}\n")
-
+    try:
+        if _job_exec_log_file is None:
+            JOB_EXEC_TIMING_LOG.parent.mkdir(parents=True, exist_ok=True)
+            _job_exec_log_file = open(
+                JOB_EXEC_TIMING_LOG,
+                "a",
+                buffering=1
+            )
+        _job_exec_log_file.write(f"{key_type},{duration_ms:.3f}\n")
+    except Exception as e:
+        logger.debug("Failed recording job execution timing: %s", e)
 
 USE_NOOP_JOB = os.getenv("USE_NOOP_JOB", "false").lower() == "true"
 
 async def process_notification_job_noop(job):
     """Synthetic no-op job: zero Redis calls, immediate return."""
     return
-
 
 async def send_notification_noop(ctx, payload: dict, replay_count: int = 0):
     idempotency_key = payload.get("idempotency_key")
@@ -386,11 +435,14 @@ async def send_notification_noop(ctx, payload: dict, replay_count: int = 0):
     duration_ms = (t1 - t0) * 1000
     _record_job_exec_timing(duration_ms, key_type=key_type)
 
-
 async def send_notification(ctx, payload: dict, replay_count: int = 0):
-    import logging
-    logger = logging.getLogger("arq")
-    logger.info(f"Notification job received. Payload: {payload}, Replay Count: {replay_count}")
+    arq_log = logging.getLogger("arq")
+    # Log sanitized metadata instead of unbounded raw payload
+    arq_log.info(
+        "Notification job received. IdempotencyKey: %s, Replay Count: %d",
+        payload.get("idempotency_key"),
+        replay_count
+    )
 
     idempotency_key = payload.get("idempotency_key")
     if not idempotency_key:
@@ -410,7 +462,6 @@ async def send_notification(ctx, payload: dict, replay_count: int = 0):
     t1 = time.perf_counter()
     duration_ms = (t1 - t0) * 1000
     _record_job_exec_timing(duration_ms, key_type=key_type)
-
 
 @app.post("/v1/notifications")
 async def create_notification(
@@ -464,8 +515,13 @@ async def create_notification(
     else:
         # status_code == 3: new key — enqueue via ARQ
         payload_dict = payload.model_dump()
+        payload_dict["user_id"] = user.id
+        payload_dict["full_idempotency_key"] = key
+        
         t0_arq = time.monotonic()
         job_func_name = "send_notification_noop" if USE_NOOP_JOB else "send_notification"
+        if arq_pool is None:
+            raise HTTPException(status_code=500, detail="ARQ queue pool not initialized.")
         await arq_pool.enqueue_job(job_func_name, payload_dict, replay_count=0)
         t1_arq = time.monotonic()
         elapsed_arq = (t1_arq - t0_arq) * 1000
@@ -491,17 +547,19 @@ async def create_notification(
 
     return response
 
-
 @app.post("/v1/admin/flush_timing")
 async def flush_timing():
     global _timing_buffer
-    with open("c:/Users/lithe/Downloads/Distributed Notification Engine/timing.log", "a") as f:
-        for msg in _timing_buffer:
-            f.write(msg + "\n")
+    try:
+        TIMING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(TIMING_LOG_PATH, "a") as f:
+            for msg in _timing_buffer:
+                f.write(msg + "\n")
+    except Exception as e:
+        logger.debug("Failed flushing timing buffer: %s", e)
     timing_count = len(_timing_buffer)
     _timing_buffer.clear()
     return {"status": "success", "flushed_count": timing_count}
-
 
 # --- Worker Job Processor Implementation ---
 
@@ -531,16 +589,33 @@ _redis_call_log_file = None
 
 def _record_redis_call_latency(op_name: str, duration_ms: float):
     global _redis_call_log_file
-    if _redis_call_log_file is None:
-        os.makedirs("c:/Users/lithe/Downloads/Distributed Notification Engine/scratch", exist_ok=True)
-        _redis_call_log_file = open(
-            "c:/Users/lithe/Downloads/Distributed Notification Engine/scratch/redis_call_latencies.log",
-            "a",
-            buffering=1
-        )
-    _redis_call_log_file.write(f"{op_name},{duration_ms:.4f}\n")
+    try:
+        if _redis_call_log_file is None:
+            REDIS_CALL_LATENCY_LOG.parent.mkdir(parents=True, exist_ok=True)
+            _redis_call_log_file = open(
+                REDIS_CALL_LATENCY_LOG,
+                "a",
+                buffering=1
+            )
+        _redis_call_log_file.write(f"{op_name},{duration_ms:.4f}\n")
+    except Exception as e:
+        logger.debug("Failed recording redis call latency: %s", e)
 
 _current_concurrent_jobs = 0
+
+async def _cache_terminal_idempotency_response(job, sent_ttl: int):
+    """Stores terminal JSON response under idempotency key so idempotent queries can replay verbatim."""
+    user_id = job.payload.get("user_id", "test_user_id")
+    full_key = job.payload.get("full_idempotency_key") or make_idempotency_key(user_id, job.idempotency_key)
+    cached_data = {
+        "status_code": 200,
+        "body": {
+            "status": "success",
+            "idempotency_key": job.idempotency_key,
+            "detail": "Notification delivered successfully."
+        }
+    }
+    await redis.set(full_key, json.dumps(cached_data), ex=sent_ttl)
 
 async def process_notification_job(job):
     global _current_concurrent_jobs
@@ -559,11 +634,12 @@ async def process_notification_job(job):
             existing_state = await redis.get(sent_key)
             _record_redis_call_latency("get_sent_state", (time.perf_counter() - t_c0) * 1000)
 
-            if existing_state == b"SENT":
+            if existing_state == b"SENT" or existing_state == "SENT":
+                await _cache_terminal_idempotency_response(job, sent_ttl)
                 await finalize_job_status(job, status="DELIVERED")
                 return
 
-            if existing_state == b"SENDING":
+            if existing_state == b"SENDING" or existing_state == "SENDING":
                 await redis.incr("metrics:reconciliation_hits")
                 reconcile_lock = f"reconciling:{job.idempotency_key}"
                 reconcile_ttl = await get_reconcile_lock_ttl()
@@ -584,6 +660,7 @@ async def process_notification_job(job):
                         t_c0 = time.perf_counter()
                         await redis.set(sent_key, "SENT", ex=sent_ttl)
                         _record_redis_call_latency("set_sent", (time.perf_counter() - t_c0) * 1000)
+                        await _cache_terminal_idempotency_response(job, sent_ttl)
                         await finalize_job_status(job, status="DELIVERED")
                         return
 
@@ -592,6 +669,7 @@ async def process_notification_job(job):
                         t_c0 = time.perf_counter()
                         await redis.set(sent_key, "SENT", ex=sent_ttl)
                         _record_redis_call_latency("set_sent", (time.perf_counter() - t_c0) * 1000)
+                        await _cache_terminal_idempotency_response(job, sent_ttl)
                         await finalize_job_status(job, status="DELIVERED")
                         return
                     except TransientGatewayError as exc:
@@ -622,6 +700,7 @@ async def process_notification_job(job):
             t_c0 = time.perf_counter()
             await redis.set(sent_key, "SENT", ex=sent_ttl)
             _record_redis_call_latency("set_sent", (time.perf_counter() - t_c0) * 1000)
+            await _cache_terminal_idempotency_response(job, sent_ttl)
             await finalize_job_status(job, status="DELIVERED")
         except TransientGatewayError as exc:
             await redis.delete(sent_key)
@@ -635,15 +714,16 @@ async def process_notification_job(job):
     finally:
         _current_concurrent_jobs -= 1
 
-
 MAX_REPLAY_LIMIT = int(os.getenv("MAX_REPLAY_LIMIT", "5"))
 
 async def replay_dlq_job(dlq_job_id: str, queue):
-    import uuid
     try:
         dlq_uuid = uuid.UUID(str(dlq_job_id))
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid UUID format for DLQ job ID.")
+
+    if db_pool is None:
+        raise HTTPException(status_code=500, detail="Database pool not initialized.")
 
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -663,13 +743,11 @@ async def replay_dlq_job(dlq_job_id: str, queue):
                 raise HTTPException(status_code=400, detail="Maximum replay limit reached.")
             raise HTTPException(status_code=404, detail="DLQ job not found.")
 
-        # Corrected signature matching arq_pool.enqueue_job("send_notification", payload, replay_count=...)
         payload = row["payload"]
         if isinstance(payload, str):
             payload = json.loads(payload)
         await queue.enqueue_job("send_notification", payload, replay_count=row["replay_count"])
         return {"replayed": True, "replay_count": row["replay_count"]}
-
 
 class DLQJobResponse(BaseModel):
     id: uuid.UUID
@@ -678,10 +756,8 @@ class DLQJobResponse(BaseModel):
     stack_trace: str | None
     created_at: datetime
 
-
 class ReplayIn(BaseModel):
     dlq_job_id: str
-
 
 @app.get("/v1/admin/dlq", response_model=list[DLQJobResponse])
 async def get_dlq_jobs(
@@ -713,7 +789,6 @@ async def get_dlq_jobs(
         for r in rows
     ]
 
-
 @app.post("/v1/admin/dlq/replay")
 async def replay_dlq_endpoint(
     body: ReplayIn,
@@ -723,7 +798,6 @@ async def replay_dlq_endpoint(
         raise HTTPException(status_code=500, detail="ARQ pool not initialized.")
     return await replay_dlq_job(body.dlq_job_id, arq_pool)
 
-
 class MetricsResponse(BaseModel):
     ingestion_lock_contention: int
     reconciliation_hits: int
@@ -731,7 +805,6 @@ class MetricsResponse(BaseModel):
     fencing_token_release_failures: int
     contention_requeue_exhaustion: int
     dlq_depth: int
-
 
 @app.get("/v1/admin/metrics", response_model=MetricsResponse)
 async def get_metrics(admin_user: User = Security(get_current_admin_user)):
@@ -756,6 +829,6 @@ async def get_metrics(admin_user: User = Security(get_current_admin_user)):
         "reconciliation_hits": reconciliation_hits,
         "reconciliation_lock_contention": reconciliation_lock_contention,
         "fencing_token_release_failures": fencing_token_release_failures,
-        "contention_requeue_exhaustion": contention_requeue_exhaustion,
-        "dlq_depth": dlq_depth
+        "contention_requeue_exhaustion": contention_requeue_exhaustion or 0,
+        "dlq_depth": dlq_depth or 0
     }

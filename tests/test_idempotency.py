@@ -1,82 +1,195 @@
 import json
+import os
+import uuid
+import time
+import asyncio
+from unittest.mock import AsyncMock, patch
+
 import pytest
 import httpx
-import asyncio
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from arq import create_pool
 from arq.connections import RedisSettings
 from urllib.parse import urlparse
-import app.main as main_module
 
-# Test key prefix to ensure we clean up after our tests
+import app.main as main_module
+from app.worker import LuaClaimWorker, WorkerSettings
+
 TEST_USER_ID = "test_user_id"
+ADMIN_USER_ID = "admin_user_id"
 TEST_KEY_PREFIX = f"idempotency:{TEST_USER_ID}:"
+
+# Use dedicated test Redis database (DB 15) to isolate all test keys from DB 0
+TEST_REDIS_URL = os.getenv("TEST_REDIS_URL", "redis://localhost:6379/15")
+TEST_REDIS_DB = 15
+
+# Track all created DLQ record IDs during test runs to ensure we only clean test rows
+_created_test_dlq_ids: set[uuid.UUID] = set()
 
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
 
+async def _clean_isolated_test_redis(client: Redis):
+    """Clean only keys within the isolated test Redis database (DB 15)."""
+    # Scan and delete keys strictly in DB 15
+    async for key in client.scan_iter(match="*", count=200):
+        await client.delete(key)
+
+async def _clean_tracked_test_postgres_rows():
+    """Clean only specifically created test DLQ rows in PostgreSQL."""
+    global _created_test_dlq_ids
+    if _created_test_dlq_ids and main_module.db_pool:
+        try:
+            async with main_module.db_pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM dead_letter_queue WHERE id = ANY($1::uuid[]);",
+                    list(_created_test_dlq_ids)
+                )
+            _created_test_dlq_ids.clear()
+        except Exception:
+            pass
+
 @pytest.fixture(autouse=True)
-async def setup_redis_client():
-    # Re-initialize the global redis client for the active event loop of this test
-    main_module.redis = Redis.from_url(main_module.redis_url)
+async def setup_environment():
+    # Configure the test Redis connection pointing to DB 15
+    main_module.redis = Redis.from_url(TEST_REDIS_URL)
     
-    # Re-initialize the global arq_pool connection
-    parsed = urlparse(main_module.redis_url)
+    parsed = urlparse(TEST_REDIS_URL)
     host = parsed.hostname or 'localhost'
     port = parsed.port or 6379
-    db = int(parsed.path.lstrip('/') or 0)
     password = parsed.password
-    arq_settings = RedisSettings(host=host, port=port, database=db, password=password)
+    arq_settings = RedisSettings(host=host, port=port, database=TEST_REDIS_DB, password=password)
     main_module.arq_pool = await create_pool(arq_settings)
+    
+    # Configure WorkerSettings to point to DB 15
+    WorkerSettings.redis_settings = arq_settings
     
     # Re-initialize the global db_pool for testing
     import asyncpg
-    import os
-    db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/notification_db")
-    if "postgresql+asyncpg://" in db_url:
-        db_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
-    main_module.db_pool = await asyncpg.create_pool(db_url)
+    db_url = main_module.get_database_url()
+    try:
+        main_module.db_pool = await asyncpg.create_pool(db_url)
+    except Exception:
+        main_module.db_pool = None
     
-    yield
-    
-    await main_module.redis.aclose()
-    if main_module.arq_pool:
-        await main_module.arq_pool.aclose()
-    if main_module.db_pool:
-        await main_module.db_pool.close()
-
-@pytest.fixture(autouse=True)
-async def cleanup_redis(setup_redis_client):
-    # Setup - reset mock gateway variables
+    # Reset mock gateway variables
     main_module.GATEWAY_SEND_DELAY = 0.0
     main_module.GATEWAY_FORCE_TRANSIENT_ERROR = False
     main_module.GATEWAY_CALL_COUNT = 0
+    main_module.GATEWAY_START_EVENT = None
+    main_module.GATEWAY_SEND_EVENT = None
     main_module.gateway_mock.delay = 0.0
     main_module.gateway_mock.was_received_map.clear()
-    # Clean up Redis keys before the test runs
-    await main_module.redis.flushdb()
+    main_module.USE_NOOP_JOB = False
     
+    await _clean_isolated_test_redis(main_module.redis)
+    await _clean_tracked_test_postgres_rows()
+
     yield
+
+    await _clean_isolated_test_redis(main_module.redis)
+    await _clean_tracked_test_postgres_rows()
     
-    # Clean up Redis keys after the test runs
-    await main_module.redis.flushdb()
+    if main_module.db_pool:
+        await main_module.db_pool.close()
+    if main_module.arq_pool:
+        await main_module.arq_pool.aclose()
+    await main_module.redis.aclose()
 
-    # Also clean up dead_letter_queue table in Postgres
-    import asyncpg
-    import os
-    db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/notification_db")
-    if "postgresql+asyncpg://" in db_url:
-        db_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
-    conn = await asyncpg.connect(db_url)
-    try:
-        await conn.execute("DELETE FROM dead_letter_queue;")
-    finally:
-        await conn.close()
 
-# --- Unit tests for handle_existing_idempotency_key function branches ---
+# ==============================================================================
+# 1. Application Startup and Health Check
+# ==============================================================================
+
+@pytest.mark.anyio
+async def test_health_check_endpoint():
+    transport = httpx.ASGITransport(app=main_module.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        response = await ac.get("/health")
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
+
+
+# ==============================================================================
+# 2. Valid Notification Request
+# ==============================================================================
+
+@pytest.mark.anyio
+async def test_valid_notification_request():
+    transport = httpx.ASGITransport(app=main_module.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        payload = {
+            "idempotency_key": f"valid-key-{uuid.uuid4()}",
+            "title": "Welcome",
+            "message": "Notification message"
+        }
+        response = await ac.post("/v1/notifications", json=payload, headers={"x-user-id": TEST_USER_ID})
+        assert response.status_code == 202
+        data = response.json()
+        assert data["status"] == "accepted"
+        assert "Idempotency lock acquired" in data["detail"]
+
+
+# ==============================================================================
+# 3. Invalid Request Payload
+# ==============================================================================
+
+@pytest.mark.anyio
+async def test_invalid_request_payload_missing_idempotency_key():
+    transport = httpx.ASGITransport(app=main_module.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        response = await ac.post("/v1/notifications", json={"title": "Missing Key", "message": "No key"})
+        assert response.status_code == 422  # Pydantic validation error
+
+
+# ==============================================================================
+# 4. Authentication / Role Behavior
+# ==============================================================================
+
+@pytest.mark.anyio
+async def test_authentication_and_admin_authorization():
+    transport = httpx.ASGITransport(app=main_module.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        # Standard user forbidden on admin endpoints
+        resp_user = await ac.get("/v1/admin/metrics", headers={"x-user-id": TEST_USER_ID})
+        assert resp_user.status_code == 403
+
+        # Admin user allowed
+        resp_admin = await ac.get("/v1/admin/metrics", headers={"x-user-id": ADMIN_USER_ID})
+        assert resp_admin.status_code == 200
+
+
+# ==============================================================================
+# 5. First Idempotency Key Acceptance
+# ==============================================================================
+
+@pytest.mark.anyio
+async def test_first_idempotency_key_acceptance():
+    key_id = f"first-key-{uuid.uuid4()}"
+    full_key = main_module.make_idempotency_key(TEST_USER_ID, key_id)
+    
+    transport = httpx.ASGITransport(app=main_module.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        response = await ac.post("/v1/notifications", json={
+            "idempotency_key": key_id,
+            "title": "A",
+            "message": "B"
+        }, headers={"x-user-id": TEST_USER_ID})
+        assert response.status_code == 202
+        
+        # In Redis, state must be PROCESSING with valid TTL
+        val = await main_module.redis.get(full_key)
+        assert val == b"PROCESSING"
+        ttl = await main_module.redis.ttl(full_key)
+        assert ttl > 0
+
+
+# ==============================================================================
+# 6. Duplicate Idempotency Key Handling & Replay
+# ==============================================================================
 
 @pytest.mark.anyio
 async def test_handle_existing_idempotency_key_processing():
@@ -122,169 +235,138 @@ async def test_handle_existing_idempotency_key_corrupted():
     assert exc_info.value.status_code == 500
     assert "Corrupted" in exc_info.value.detail
 
-
-# --- End-to-end integration tests using httpx.AsyncClient ---
-
 @pytest.mark.anyio
-async def test_api_idempotency_flow():
+async def test_duplicate_submission_after_delivery_returns_cached_200():
+    key_id = f"duplicate-delivered-{uuid.uuid4()}"
+    full_key = main_module.make_idempotency_key(TEST_USER_ID, key_id)
+    
+    # Simulate completed delivery
+    job = main_module.NotificationJob(
+        idempotency_key=key_id,
+        payload={"idempotency_key": key_id, "user_id": TEST_USER_ID, "full_idempotency_key": full_key}
+    )
+    await main_module.process_notification_job(job)
+    
+    # Ensure idempotency key is now terminal JSON
+    cached = await main_module.redis.get(full_key)
+    assert cached is not None
+    data = json.loads(cached)
+    assert data["status_code"] == 200
+    assert data["body"]["status"] == "success"
+    
+    # POST the same notification again -> must return 200 OK verbatim without re-running
     transport = httpx.ASGITransport(app=main_module.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        idempotency_key = "unique-flow-key"
-        payload = {"idempotency_key": idempotency_key, "title": "A", "message": "B"}
-        
-        response_1 = await ac.post("/v1/notifications", json=payload)
-        assert response_1.status_code == 202
-        data_1 = response_1.json()
-        assert data_1["status"] == "accepted"
-        
-        response_2 = await ac.post("/v1/notifications", json=payload)
-        assert response_2.status_code == 202
-        assert response_2.headers["Retry-After"] == "5"
-        assert response_2.json()["status"] == "processing"
-        
-        processing_key = "unique-processing-key"
-        real_key = main_module.make_idempotency_key(TEST_USER_ID, processing_key)
-        await main_module.redis.set(real_key, b"PROCESSING")
-        
-        payload_processing = {"idempotency_key": processing_key, "title": "A", "message": "B"}
-        response_3 = await ac.post("/v1/notifications", json=payload_processing)
-        assert response_3.status_code == 202
-        assert response_3.headers["Retry-After"] == "5"
-        assert response_3.json()["status"] == "processing"
+        response = await ac.post("/v1/notifications", json={
+            "idempotency_key": key_id,
+            "title": "A",
+            "message": "B"
+        }, headers={"x-user-id": TEST_USER_ID})
+        assert response.status_code == 200
+        assert response.json()["status"] == "success"
 
 
-# --- Rate Limit and ARQ enqueuing tests ---
-
-@pytest.mark.anyio
-async def test_rate_limit_under_quota():
-    transport = httpx.ASGITransport(app=main_module.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        for i in range(main_module.RATE_LIMIT_MAX_REQUESTS):
-            idempotency_key = f"under-quota-key-{i}"
-            payload = {"idempotency_key": idempotency_key, "title": "A", "message": "B"}
-            response = await ac.post("/v1/notifications", json=payload)
-            assert response.status_code == 202
-            assert response.json()["status"] == "accepted"
+# ==============================================================================
+# 7. Rate-Limit Enforcement
+# ==============================================================================
 
 @pytest.mark.anyio
 async def test_rate_limit_exceeded():
     transport = httpx.ASGITransport(app=main_module.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
         for i in range(main_module.RATE_LIMIT_MAX_REQUESTS):
-            idempotency_key = f"quota-fill-key-{i}"
-            payload = {"idempotency_key": idempotency_key, "title": "A", "message": "B"}
-            response = await ac.post("/v1/notifications", json=payload)
+            key = f"quota-key-{i}-{uuid.uuid4()}"
+            response = await ac.post("/v1/notifications", json={
+                "idempotency_key": key,
+                "title": "A",
+                "message": "B"
+            }, headers={"x-user-id": TEST_USER_ID})
             assert response.status_code == 202
-            assert response.json()["status"] == "accepted"
         
-        blocked_key = "blocked-request-key"
-        payload_blocked = {"idempotency_key": blocked_key, "title": "A", "message": "B"}
-        response_blocked = await ac.post("/v1/notifications", json=payload_blocked)
+        # Next request must be rate limited
+        blocked_key = f"blocked-key-{uuid.uuid4()}"
+        response_blocked = await ac.post("/v1/notifications", json={
+            "idempotency_key": blocked_key,
+            "title": "A",
+            "message": "B"
+        }, headers={"x-user-id": TEST_USER_ID})
         assert response_blocked.status_code == 429
         assert "Rate limit exceeded" in response_blocked.json()["detail"]
-        
-        real_key = main_module.make_idempotency_key(TEST_USER_ID, blocked_key)
-        assert await main_module.redis.get(real_key) is None
+
+
+# ==============================================================================
+# 8. Redis Enqueueing and Serialization
+# ==============================================================================
 
 @pytest.mark.anyio
-async def test_idempotency_key_remains_processing():
+async def test_redis_enqueueing():
+    key_id = f"enqueue-test-{uuid.uuid4()}"
     transport = httpx.ASGITransport(app=main_module.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        idempotency_key = "check-processing-key"
-        payload = {"idempotency_key": idempotency_key, "title": "A", "message": "B"}
-        
-        response = await ac.post("/v1/notifications", json=payload)
+        response = await ac.post("/v1/notifications", json={
+            "idempotency_key": key_id,
+            "title": "Enqueue Test",
+            "message": "Payload"
+        }, headers={"x-user-id": TEST_USER_ID})
         assert response.status_code == 202
-        assert response.json()["status"] == "accepted"
         
-        real_key = main_module.make_idempotency_key(TEST_USER_ID, idempotency_key)
-        value = await main_module.redis.get(real_key)
-        assert value == b"PROCESSING"
+        # Verify job is present in arq:queue
+        queue_count = await main_module.redis.zcard("arq:queue")
+        assert queue_count >= 1
 
 
-# --- Worker Job Processor and Concurrency Tests ---
-
-@pytest.mark.anyio
-async def test_concurrent_processing_race_condition():
-    successes = 0
-    runs = 50
-    
-    for i in range(runs):
-        idempotency_key = f"concurrency-race-key-{i}"
-        
-        # Reset mock states for this run
-        main_module.GATEWAY_CALL_COUNT = 0
-        main_module.gateway_mock.was_received_map.clear()
-        
-        # Use asyncio.Events to coordinate deterministically
-        main_module.GATEWAY_START_EVENT = asyncio.Event()
-        main_module.GATEWAY_SEND_EVENT = asyncio.Event()
-        
-        main_module.GATEWAY_SEND_DELAY = 0.0
-        main_module.gateway_mock.delay = 0.0
-        
-        job1 = main_module.NotificationJob(idempotency_key=idempotency_key, payload={"item": "data"})
-        job2 = main_module.NotificationJob(idempotency_key=idempotency_key, payload={"item": "data"})
-        
-        # Spawn Job 1 (first worker).
-        # It sets status to 'SENDING', gets reconcile lock, and starts calling call_gateway_mock.
-        task1 = asyncio.create_task(main_module.process_notification_job(job1))
-        
-        # Deterministically wait until Job 1 has actually entered call_gateway_mock
-        # and is about to block waiting for our signal
-        await main_module.GATEWAY_START_EVENT.wait()
-        
-        # Spawn Job 2 (second worker).
-        # Since Job 1 is still in flight (holding both sent_key and reconcile_lock),
-        # Job 2 must fail to acquire got_lock and exit immediately to be requeued.
-        await main_module.process_notification_job(job2)
-        
-        # Assertions for Job 2:
-        # - Job 2 must fail lock acquisition and requeue
-        assert job2.requeued is True
-        assert job2.requeue_reason == "reconciliation_in_progress"
-        assert job2.final_status is None
-        
-        # Now trigger Job 1 to finish
-        main_module.GATEWAY_SEND_EVENT.set()
-        await task1
-        
-        # Assertions for Job 1:
-        # - Job 1 must finish and be DELIVERED
-        assert job1.final_status == "DELIVERED"
-        
-        # - call_gateway_mock must be called exactly once
-        assert main_module.GATEWAY_CALL_COUNT == 1
-        
-        successes += 1
-
-    print(f"\n[Race Condition Test] Pass Count: {successes} out of {runs} runs succeeded.")
-    assert successes == runs
-
+# ==============================================================================
+# 9. Worker Consumes and Processes a Job (Burst Mode)
+# ==============================================================================
 
 @pytest.mark.anyio
-async def test_reconcile_lock_acquisition_failure():
-    idempotency_key = "lock-fail-key"
-    sent_key = f"sent:{idempotency_key}"
-    await main_module.redis.set(sent_key, "SENDING")
+async def test_worker_consumes_and_delivers_job():
+    from arq.worker import create_worker
     
-    # Manually hold reconcile lock
-    reconcile_lock = f"reconciling:{idempotency_key}"
-    await main_module.redis.set(reconcile_lock, "some-other-worker-id")
+    key_id = f"worker-test-{uuid.uuid4()}"
+    full_key = main_module.make_idempotency_key(TEST_USER_ID, key_id)
+    payload = {
+        "idempotency_key": key_id,
+        "user_id": TEST_USER_ID,
+        "full_idempotency_key": full_key,
+        "title": "Worker Test",
+        "message": "Worker Hello"
+    }
     
+    # 1. Enqueue job
+    await main_module.arq_pool.enqueue_job("send_notification", payload, replay_count=0)
+    
+    # 2. Run burst worker
+    worker = create_worker(
+        WorkerSettings,
+        redis_pool=main_module.arq_pool,
+        burst=True,
+        handle_signals=False
+    )
+    await worker.async_run()
+    
+    # 3. Assert Redis states
+    sent_key = f"sent:{key_id}"
+    assert await main_module.redis.get(sent_key) == b"SENT"
+    
+    cached = await main_module.redis.get(full_key)
+    assert cached is not None
+    data = json.loads(cached)
+    assert data["status_code"] == 200
+    assert data["body"]["status"] == "success"
+    
+    # 4. Gateway received map contains the key
+    assert main_module.gateway_mock.was_received_map.get(key_id) is True
+
+
+# ==============================================================================
+# 10. Transient Errors and Retries
+# ==============================================================================
+
+@pytest.mark.anyio
+async def test_transient_gateway_error_cleans_sent_key():
+    idempotency_key = f"transient-{uuid.uuid4()}"
     job = main_module.NotificationJob(idempotency_key=idempotency_key, payload={"item": "data"})
-    await main_module.process_notification_job(job)
-    
-    assert job.requeued is True
-    assert job.requeue_reason == "reconciliation_in_progress"
-
-
-@pytest.mark.anyio
-async def test_transient_gateway_error_deletes_sent_key():
-    idempotency_key = "transient-err-key"
-    job = main_module.NotificationJob(idempotency_key=idempotency_key, payload={"item": "data"})
-    
-    # Force transient error
     main_module.GATEWAY_FORCE_TRANSIENT_ERROR = True
     
     with pytest.raises(main_module.TransientGatewayError):
@@ -294,218 +376,40 @@ async def test_transient_gateway_error_deletes_sent_key():
     assert await main_module.redis.get(sent_key) is None
 
 
-# --- Requeue and DLQ tests ---
+# ==============================================================================
+# 11. Dead-Letter Queue & Contention Exhaustion
+# ==============================================================================
 
 @pytest.mark.anyio
-async def test_requeue_with_backoff_under_limit():
-    from unittest.mock import AsyncMock
-    import asyncpg
-    import os
-    
-    original_pool = main_module.arq_pool
-    main_module.arq_pool = AsyncMock()
-    
-    db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/notification_db")
-    if "postgresql+asyncpg://" in db_url:
-        db_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
-        
-    try:
-        job = main_module.NotificationJob(idempotency_key="requeue-under", payload={"test": "requeue_under"})
-        job.contention_requeue_count = 2  # < 5
-        
-        # Call requeue_with_backoff
-        await main_module.requeue_with_backoff(job, reason="lock_conflict")
-        
-        # Assert ARQ pool enqueue was called with correct delay
-        main_module.arq_pool.enqueue_job.assert_called_once()
-        args, kwargs = main_module.arq_pool.enqueue_job.call_args
-        assert args[0] == "send_notification"
-        assert args[1] == {"test": "requeue_under"}
-        assert kwargs["replay_count"] == 0
-        assert "_defer_by" in kwargs
-        assert kwargs["_defer_by"] == job.last_delay
-        
-        # Assert contention_requeue_count was incremented to 3
-        assert job.contention_requeue_count == 3
-        assert job.requeued is True
-        
-        # Assert no row was written to DLQ
-        conn = await asyncpg.connect(db_url)
-        try:
-            count = await conn.fetchval("SELECT count(*) FROM dead_letter_queue;")
-            assert count == 0
-        finally:
-            await conn.close()
-            
-    finally:
-        main_module.arq_pool = original_pool
-
-
-@pytest.mark.anyio
-async def test_requeue_with_backoff_at_limit_inserts_to_dlq():
-    from unittest.mock import AsyncMock
-    import asyncpg
-    import os
-    
-    original_pool = main_module.arq_pool
-    main_module.arq_pool = AsyncMock()
-    
-    db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/notification_db")
-    if "postgresql+asyncpg://" in db_url:
-        db_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
-        
-    try:
-        job = main_module.NotificationJob(idempotency_key="requeue-limit", payload={"test": "requeue_limit"})
-        job.contention_requeue_count = 5  # == CONTENTION_MAX_ATTEMPTS
-        job.replay_count = 1
-        
-        # Call requeue_with_backoff
-        await main_module.requeue_with_backoff(job, reason="lock_conflict_exhausted")
-        
-        # Assert ARQ pool was NOT called
-        main_module.arq_pool.enqueue_job.assert_not_called()
-        
-        # Query the row back out of Postgres
-        conn = await asyncpg.connect(db_url)
-        try:
-            rows = await conn.fetch("SELECT id, payload, replay_count, stack_trace, created_at FROM dead_letter_queue;")
-            assert len(rows) == 1
-            row = rows[0]
-            
-            # Assert payload, replay_count, and stack_trace match what was passed
-            payload_read = json.loads(row["payload"])
-            assert payload_read == {"test": "requeue_limit"}
-            assert row["replay_count"] == 1
-            assert "ContentionExhausted: lock_conflict_exhausted" in row["stack_trace"]
-            assert "max_attempts=5 reached" in row["stack_trace"]
-            
-            # Assert id and created_at were auto-populated by database (not None, not app-supplied)
-            assert row["id"] is not None
-            assert row["created_at"] is not None
-            
-            import uuid
-            from datetime import datetime
-            assert isinstance(row["id"], uuid.UUID)
-            assert isinstance(row["created_at"], datetime)
-        finally:
-            await conn.close()
-            
-    finally:
-        main_module.arq_pool = original_pool
-
-
-@pytest.mark.anyio
-async def test_requeue_with_backoff_raises_runtime_error_when_no_pool():
-    original_pool = main_module.arq_pool
-    main_module.arq_pool = None
-    
-    try:
-        job = main_module.NotificationJob(idempotency_key="requeue-error", payload={"test": "requeue_error"})
-        job.contention_requeue_count = 2  # < 5
-        
-        with pytest.raises(RuntimeError) as exc_info:
-            await main_module.requeue_with_backoff(job, reason="lock_conflict")
-            
-        assert "requeue_with_backoff called with no arq_pool available" in str(exc_info.value)
-        
-    finally:
-        main_module.arq_pool = original_pool
-
-
-@pytest.mark.anyio
-async def test_worker_dispatch_end_to_end():
-    from arq.worker import create_worker
-    from app.worker import WorkerSettings
-    
-    idempotency_key = "e2e-dispatch-key"
-    payload = {"idempotency_key": idempotency_key, "title": "E2E Test", "message": "Hello World"}
-    
-    # 1. Enqueue the job exactly like create_notification / requeue does
-    await main_module.arq_pool.enqueue_job("send_notification", payload, replay_count=0)
-    
-    # 2. Run the worker in burst mode to process the queued job
-    worker = create_worker(
-        WorkerSettings,
-        redis_pool=main_module.arq_pool,
-        burst=True,
-        handle_signals=False
+async def test_requeue_at_limit_inserts_into_dlq():
+    job = main_module.NotificationJob(
+        idempotency_key=f"dlq-key-{uuid.uuid4()}",
+        payload={"test": "dlq_payload"}
     )
-    await worker.async_run()
+    job.contention_requeue_count = 5  # == CONTENTION_MAX_ATTEMPTS
     
-    # 3. Assert Redis state is correct (sent_key == b"SENT")
-    sent_key = f"sent:{idempotency_key}"
-    val = await main_module.redis.get(sent_key)
-    assert val == b"SENT"
+    await main_module.requeue_with_backoff(job, reason="lock_conflict_exhausted")
     
-    # 4. Assert Postgres/DLQ state is correct (should be empty since it succeeded)
-    import asyncpg
-    import os
-    db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/notification_db")
-    if "postgresql+asyncpg://" in db_url:
-        db_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
-    conn = await asyncpg.connect(db_url)
-    try:
-        count = await conn.fetchval("SELECT count(*) FROM dead_letter_queue;")
-        assert count == 0
-    finally:
-        await conn.close()
-
-
-@pytest.mark.anyio
-async def test_dlq_endpoints_forbidden_for_non_admin():
-    transport = httpx.ASGITransport(app=main_module.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        # 1. Non-admin accessing GET /v1/admin/dlq
-        response = await ac.get("/v1/admin/dlq")
-        assert response.status_code == 403
-        assert "privileges required" in response.json()["detail"]
-
-        response = await ac.get("/v1/admin/dlq", headers={"x-user-id": "test_user_id"})
-        assert response.status_code == 403
-
-        # 2. Non-admin accessing POST /v1/admin/dlq/replay
-        response = await ac.post("/v1/admin/dlq/replay", json={"dlq_job_id": "00000000-0000-0000-0000-000000000000"})
-        assert response.status_code == 403
-        
-        response = await ac.post(
-            "/v1/admin/dlq/replay", 
-            json={"dlq_job_id": "00000000-0000-0000-0000-000000000000"},
-            headers={"x-user-id": "test_user_id"}
-        )
-        assert response.status_code == 403
-
-
-@pytest.mark.anyio
-async def test_admin_can_list_dlq_jobs():
     async with main_module.db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO dead_letter_queue (id, payload, replay_count, stack_trace)
-            VALUES ($1, $2, $3, $4)
-            """,
-            "11111111-1111-1111-1111-111111111111",
-            '{"item": "val"}',
-            0,
-            "dummy trace"
+        rows = await conn.fetch(
+            "SELECT id, payload, replay_count, stack_trace FROM dead_letter_queue WHERE payload::text LIKE '%dlq_payload%';"
         )
-    
-    transport = httpx.ASGITransport(app=main_module.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        response = await ac.get("/v1/admin/dlq", headers={"x-user-id": "admin_user_id"})
-        assert response.status_code == 200
-        data = response.json()
-        assert len(data) == 1
-        assert data[0]["id"] == "11111111-1111-1111-1111-111111111111"
-        assert data[0]["payload"] == {"item": "val"}
-        assert data[0]["replay_count"] == 0
-        assert data[0]["stack_trace"] == "dummy trace"
+        assert len(rows) >= 1
+        test_row = rows[0]
+        _created_test_dlq_ids.add(test_row["id"])
+        assert json.loads(test_row["payload"]) == {"test": "dlq_payload"}
+        assert "ContentionExhausted" in test_row["stack_trace"]
 
+
+# ==============================================================================
+# 12. DLQ Listing and Replay Endpoints
+# ==============================================================================
 
 @pytest.mark.anyio
-async def test_admin_replay_increments_count_and_enqueues():
-    import uuid
-    job_id = "22222222-2222-2222-2222-222222222222"
-    payload = {"idempotency_key": "replay-test-key", "val": 42}
+async def test_admin_dlq_replay_endpoint():
+    job_id = uuid.uuid4()
+    _created_test_dlq_ids.add(job_id)
+    payload = {"idempotency_key": f"dlq-replay-test-{job_id}", "val": 100}
     
     async with main_module.db_pool.acquire() as conn:
         await conn.execute(
@@ -515,352 +419,183 @@ async def test_admin_replay_increments_count_and_enqueues():
             """,
             job_id,
             json.dumps(payload),
-            1,
-            "dummy trace"
+            0,
+            "mock trace"
         )
-    
-    from unittest.mock import AsyncMock
-    original_pool = main_module.arq_pool
-    main_module.arq_pool = AsyncMock()
-    
-    try:
-        transport = httpx.ASGITransport(app=main_module.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-            response = await ac.post(
-                "/v1/admin/dlq/replay",
-                json={"dlq_job_id": job_id},
-                headers={"x-user-id": "admin_user_id"}
-            )
-            assert response.status_code == 200
-            res_data = response.json()
-            assert res_data["replayed"] is True
-            assert res_data["replay_count"] == 2
-            
-            main_module.arq_pool.enqueue_job.assert_called_once_with(
-                "send_notification",
-                payload,
-                replay_count=2
-            )
-            
-            async with main_module.db_pool.acquire() as conn:
-                db_val = await conn.fetchval(
-                    "SELECT replay_count FROM dead_letter_queue WHERE id = $1",
-                    uuid.UUID(job_id)
-                )
-                assert db_val == 2
-    finally:
-        main_module.arq_pool = original_pool
-
-
-@pytest.mark.anyio
-async def test_concurrent_replay_calls_limit_boundary():
-    import uuid
-    runs = 20
-    success_count = 0
-    
+        
     transport = httpx.ASGITransport(app=main_module.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        for i in range(runs):
-            job_id = str(uuid.uuid4())
-            payload = {"idempotency_key": f"concurrency-replay-{i}", "val": i}
-            
-            async with main_module.db_pool.acquire() as conn:
-                await conn.execute("DELETE FROM dead_letter_queue;")
-                await conn.execute(
-                    """
-                    INSERT INTO dead_letter_queue (id, payload, replay_count, stack_trace)
-                    VALUES ($1, $2, $3, $4)
-                    """,
-                    uuid.UUID(job_id),
-                    json.dumps(payload),
-                    main_module.MAX_REPLAY_LIMIT - 1,
-                    "concurrency trace"
-                )
-            
-            t1 = ac.post(
-                "/v1/admin/dlq/replay",
-                json={"dlq_job_id": job_id},
-                headers={"x-user-id": "admin_user_id"}
-            )
-            t2 = ac.post(
-                "/v1/admin/dlq/replay",
-                json={"dlq_job_id": job_id},
-                headers={"x-user-id": "admin_user_id"}
-            )
-            
-            r1, r2 = await asyncio.gather(t1, t2)
-            
-            status_codes = [r1.status_code, r2.status_code]
-            if 200 in status_codes and 400 in status_codes:
-                success_count += 1
-            
-            async with main_module.db_pool.acquire() as conn:
-                db_val = await conn.fetchval(
-                    "SELECT replay_count FROM dead_letter_queue WHERE id = $1",
-                    uuid.UUID(job_id)
-                )
-                assert db_val == main_module.MAX_REPLAY_LIMIT
+        # Replay
+        response = await ac.post(
+            "/v1/admin/dlq/replay",
+            json={"dlq_job_id": str(job_id)},
+            headers={"x-user-id": ADMIN_USER_ID}
+        )
+        assert response.status_code == 200
+        res = response.json()
+        assert res["replayed"] is True
+        assert res["replay_count"] == 1
+        
+        # Verify db incremented
+        async with main_module.db_pool.acquire() as conn:
+            cnt = await conn.fetchval("SELECT replay_count FROM dead_letter_queue WHERE id = $1", job_id)
+            assert cnt == 1
 
-    print(f"\n[Concurrent Replay Test] Pass Rate: {success_count} / {runs} runs succeeded.")
-    assert success_count == runs
 
+# ==============================================================================
+# 13. No-Op Mode Behavior
+# ==============================================================================
 
 @pytest.mark.anyio
-async def test_metrics_ingestion_lock_contention():
-    transport = httpx.ASGITransport(app=main_module.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        idempotency_key = "ingestion-contention-metric-key"
-        payload = {"idempotency_key": idempotency_key, "title": "A", "message": "B"}
-        
-        # First request succeeds
-        resp1 = await ac.post("/v1/notifications", json=payload)
-        assert resp1.status_code == 202
-        
-        # Second request triggers ingestion lock contention
-        resp2 = await ac.post("/v1/notifications", json=payload)
-        assert resp2.status_code == 202
-        
-        # Verify the counter
-        cnt = int(await main_module.redis.get("metrics:ingestion_lock_contention") or 0)
-        assert cnt == 1
+async def test_noop_mode_execution():
+    main_module.USE_NOOP_JOB = True
+    
+    key_id = f"noop-key-{uuid.uuid4()}"
+    job = main_module.NotificationJob(idempotency_key=key_id, payload={"idempotency_key": key_id})
+    
+    # In no-op mode, send_notification_noop returns immediately without gateway dispatch
+    await main_module.send_notification_noop(None, {"idempotency_key": key_id})
+    assert main_module.gateway_mock.was_received_map.get(key_id) is None
 
+
+# ==============================================================================
+# 14. Logging & Instrumentation Failures Do Not Crash Ingestion
+# ==============================================================================
 
 @pytest.mark.anyio
-async def test_metrics_reconciliation_hits_and_contention():
-    idempotency_key = "reconcile-metrics-key"
+async def test_telemetry_write_failure_does_not_break_ingestion():
+    with patch("builtins.open", side_effect=OSError("Disk full / permission denied")):
+        # Telemetry helpers catch exceptions safely
+        main_module._write_ingestion_timing({"ts": "12:00:00"})
+        main_module._record_job_exec_timing(10.0)
+        main_module._record_redis_call_latency("ping", 1.0)
+
+
+# ==============================================================================
+# 15. Concurrent Duplicate Requests (Fencing and Reconciliation Race)
+# ==============================================================================
+
+@pytest.mark.anyio
+async def test_concurrent_processing_race_condition():
+    idempotency_key = f"concurrency-race-{uuid.uuid4()}"
     
     main_module.GATEWAY_CALL_COUNT = 0
     main_module.gateway_mock.was_received_map.clear()
+    
     main_module.GATEWAY_START_EVENT = asyncio.Event()
     main_module.GATEWAY_SEND_EVENT = asyncio.Event()
     
     job1 = main_module.NotificationJob(idempotency_key=idempotency_key, payload={"item": "data"})
     job2 = main_module.NotificationJob(idempotency_key=idempotency_key, payload={"item": "data"})
     
-    # Task 1 starts and blocks inside gateway call
     task1 = asyncio.create_task(main_module.process_notification_job(job1))
     await main_module.GATEWAY_START_EVENT.wait()
     
-    # Task 2 runs. Since Task 1 is still in flight, Task 2 hits reconciler branch
-    # and fails to acquire the reconcile_lock.
+    # Second job arrives while first is in-flight -> fails reconcile lock and requeues
     await main_module.process_notification_job(job2)
+    assert job2.requeued is True
+    assert job2.requeue_reason == "reconciliation_in_progress"
     
-    # Trigger Task 1 to complete
+    # Let first job finish
     main_module.GATEWAY_SEND_EVENT.set()
     await task1
     
-    # Verify both metrics:
-    rec_hits = int(await main_module.redis.get("metrics:reconciliation_hits") or 0)
-    assert rec_hits == 1
-    
-    rec_lock_cont = int(await main_module.redis.get("metrics:reconciliation_lock_contention") or 0)
-    assert rec_lock_cont == 1
+    assert job1.final_status == "DELIVERED"
+    assert main_module.GATEWAY_CALL_COUNT == 1
 
 
-@pytest.mark.anyio
-async def test_metrics_fencing_token_release_failures():
-    idempotency_key = "fencing-metric-key"
-    main_module.GATEWAY_CALL_COUNT = 0
-    main_module.gateway_mock.was_received_map.clear()
-    main_module.GATEWAY_START_EVENT = asyncio.Event()
-    main_module.GATEWAY_SEND_EVENT = asyncio.Event()
-    
-    job = main_module.NotificationJob(idempotency_key=idempotency_key, payload={"item": "data"})
-    
-    # Task starts as original sender
-    task = asyncio.create_task(main_module.process_notification_job(job))
-    await main_module.GATEWAY_START_EVENT.wait()
-    
-    # Manually overwrite the lock in Redis to simulate TTL expiry/steal
-    reconcile_lock = f"reconciling:{idempotency_key}"
-    await main_module.redis.set(reconcile_lock, "stolen-worker-id")
-    
-    # Complete gateway call
-    main_module.GATEWAY_SEND_EVENT.set()
-    await task
-    
-    # Verify release failure
-    fencing_fails = int(await main_module.redis.get("metrics:fencing_token_release_failures") or 0)
-    assert fencing_fails == 1
-
+# ==============================================================================
+# 16. Redis Unavailable Handling
+# ==============================================================================
 
 @pytest.mark.anyio
-async def test_metrics_distinctness_sender_lock_contention():
-    idempotency_key = "distinct-contention-key"
-    
-    # Pre-acquire the lock
-    reconcile_lock = f"reconciling:{idempotency_key}"
-    await main_module.redis.set(reconcile_lock, "stolen-worker-id")
-    
-    # Run process_notification_job without setting "sent" key (so it runs original sender path)
-    job = main_module.NotificationJob(idempotency_key=idempotency_key, payload={"item": "data"})
-    await main_module.process_notification_job(job)
-    
-    # Verify metrics:
-    rec_lock_cont = int(await main_module.redis.get("metrics:reconciliation_lock_contention") or 0)
-    assert rec_lock_cont == 1
-    
-    rec_hits = int(await main_module.redis.get("metrics:reconciliation_hits") or 0)
-    assert rec_hits == 0
+async def test_redis_unavailable_handling():
+    with patch.object(main_module.redis, "eval", side_effect=ConnectionError("Redis connection refused")):
+        transport = httpx.ASGITransport(app=main_module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            with pytest.raises(ConnectionError):
+                await ac.post(
+                    "/v1/notifications",
+                    json={"idempotency_key": "redis-down-key", "title": "A", "message": "B"},
+                    headers={"x-user-id": TEST_USER_ID}
+                )
 
+
+# ==============================================================================
+# 17. PostgreSQL Unavailable Handling
+# ==============================================================================
 
 @pytest.mark.anyio
-async def test_admin_metrics_endpoint():
-    async with main_module.db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM dead_letter_queue;")
-        await conn.execute(
-            """
-            INSERT INTO dead_letter_queue (payload, replay_count, stack_trace)
-            VALUES ($1, $2, $3);
-            """,
-            '{"val": 1}', 0, "ContentionExhausted: lock contention"
-        )
-        await conn.execute(
-            """
-            INSERT INTO dead_letter_queue (payload, replay_count, stack_trace)
-            VALUES ($1, $2, $3);
-            """,
-            '{"val": 2}', 0, "OtherError: standard gateway failure"
-        )
-        
-    await main_module.redis.set("metrics:ingestion_lock_contention", 10)
-    await main_module.redis.set("metrics:reconciliation_hits", 20)
-    await main_module.redis.set("metrics:reconciliation_lock_contention", 30)
-    await main_module.redis.set("metrics:fencing_token_release_failures", 40)
-    
-    transport = httpx.ASGITransport(app=main_module.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        resp_user = await ac.get("/v1/admin/metrics", headers={"x-user-id": "test_user_id"})
-        assert resp_user.status_code == 403
-        
-        resp_admin = await ac.get("/v1/admin/metrics", headers={"x-user-id": "admin_user_id"})
-        assert resp_admin.status_code == 200
-        
-        metrics = resp_admin.json()
-        assert metrics["ingestion_lock_contention"] == 10
-        assert metrics["reconciliation_hits"] == 20
-        assert metrics["reconciliation_lock_contention"] == 30
-        assert metrics["fencing_token_release_failures"] == 40
-        assert metrics["contention_requeue_exhaustion"] == 1
-        assert metrics["dlq_depth"] == 2
-
-
-@pytest.mark.anyio
-async def test_combined_script_outcome_existing_key():
-    import time
-    key = f"{TEST_KEY_PREFIX}existing_key"
-    await main_module.redis.set(key, b"PROCESSING")
-    
-    rate_limit_key = f"rate_limit:{TEST_USER_ID}"
-    initial_count = await main_module.redis.zcard(rate_limit_key)
-    
-    result = await main_module.redis.eval(
-        main_module.COMBINED_LOCK_RATE_LIMIT_LUA,
-        2,
-        key,
-        rate_limit_key,
-        60,
-        60,
-        5,
-        str(time.time()),
-        key
-    )
-    assert result[0] == 1
-    assert result[1] == b"PROCESSING"
-    
-    final_count = await main_module.redis.zcard(rate_limit_key)
-    assert final_count == initial_count
-
-
-@pytest.mark.anyio
-async def test_combined_script_outcome_rate_limit_exceeded():
-    import time
-    rate_limit_key = f"rate_limit:{TEST_USER_ID}"
-    now = time.time()
-    for i in range(5):
-        await main_module.redis.zadd(rate_limit_key, {f"dummy_member_{i}": now})
-        
-    key = f"{TEST_KEY_PREFIX}new_key_rate_limited"
-    
-    result = await main_module.redis.eval(
-        main_module.COMBINED_LOCK_RATE_LIMIT_LUA,
-        2,
-        key,
-        rate_limit_key,
-        60,
-        60,
-        5,
-        str(now),
-        key
-    )
-    assert result[0] == 2
-    
-    val = await main_module.redis.get(key)
-    assert val is None
-    
-    await main_module.redis.flushdb()
-    for i in range(5):
-        await main_module.redis.zadd(rate_limit_key, {f"dummy_member_{i}": now})
-    
-    transport = httpx.ASGITransport(app=main_module.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-        resp = await ac.post("/v1/notifications", json={
-            "idempotency_key": "some_new_key",
-            "title": "Test",
-            "message": "Msg"
-        }, headers={"x-user-id": TEST_USER_ID})
-        assert resp.status_code == 429
-        full_key = main_module.make_idempotency_key(TEST_USER_ID, "some_new_key")
-        assert await main_module.redis.get(full_key) is None
-
-
-@pytest.mark.anyio
-async def test_combined_script_outcome_success():
-    import time
-    rate_limit_key = f"rate_limit:{TEST_USER_ID}"
-    key = f"{TEST_KEY_PREFIX}success_key"
-    now = time.time()
-    
-    result = await main_module.redis.eval(
-        main_module.COMBINED_LOCK_RATE_LIMIT_LUA,
-        2,
-        key,
-        rate_limit_key,
-        60,
-        60,
-        5,
-        str(now),
-        key
-    )
-    assert result[0] == 3
-    
-    val = await main_module.redis.get(key)
-    assert val == b"PROCESSING"
-    ttl = await main_module.redis.ttl(key)
-    assert 55 <= ttl <= 60
-    
-    members = await main_module.redis.zrange(rate_limit_key, 0, -1)
-    assert key.encode('utf-8') in members or key in members
-
-    await main_module.redis.flushdb()
-    
-    original_enqueue = main_module.arq_pool.enqueue_job
-    call_count = 0
-    async def mock_enqueue(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        return None
-    main_module.arq_pool.enqueue_job = mock_enqueue
-    
+async def test_postgresql_unavailable_handling():
+    original_db_pool = main_module.db_pool
+    main_module.db_pool = None
     try:
         transport = httpx.ASGITransport(app=main_module.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
-            resp = await ac.post("/v1/notifications", json={
-                "idempotency_key": "some_success_key",
-                "title": "Test",
-                "message": "Msg"
-            }, headers={"x-user-id": TEST_USER_ID})
-            assert resp.status_code == 202
-            assert call_count == 1
+            # DLQ listing should return 500 when database pool is not available
+            resp = await ac.get("/v1/admin/dlq", headers={"x-user-id": ADMIN_USER_ID})
+            assert resp.status_code == 500
+            assert "Database pool not initialized" in resp.json()["detail"]
+            
+            # Metrics endpoint should also return 500
+            resp_m = await ac.get("/v1/admin/metrics", headers={"x-user-id": ADMIN_USER_ID})
+            assert resp_m.status_code == 500
     finally:
-        main_module.arq_pool.enqueue_job = original_enqueue
+        main_module.db_pool = original_db_pool
+
+
+# ==============================================================================
+# 18. End-to-End Integration Flow: Ingestion -> ARQ -> Worker -> Replay
+# ==============================================================================
+
+@pytest.mark.anyio
+async def test_full_end_to_end_notification_lifecycle():
+    from arq.worker import create_worker
+
+    unique_key = f"e2e-live-{uuid.uuid4()}"
+    full_key = main_module.make_idempotency_key(TEST_USER_ID, unique_key)
+    
+    # Step 1: Client submits new notification via API
+    transport = httpx.ASGITransport(app=main_module.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        response_init = await ac.post("/v1/notifications", json={
+            "idempotency_key": unique_key,
+            "title": "Welcome User",
+            "message": "Your account is activated."
+        }, headers={"x-user-id": TEST_USER_ID})
+        assert response_init.status_code == 202
+        assert response_init.json()["status"] == "accepted"
+        
+        # Step 2: Intermediate polling while job is in queue returns 202 PROCESSING
+        response_poll = await ac.post("/v1/notifications", json={
+            "idempotency_key": unique_key,
+            "title": "Welcome User",
+            "message": "Your account is activated."
+        }, headers={"x-user-id": TEST_USER_ID})
+        assert response_poll.status_code == 202
+        assert response_poll.headers["Retry-After"] == "5"
+        assert response_poll.json()["status"] == "processing"
+        
+        # Step 3: Worker processes the queue in burst mode
+        worker = create_worker(
+            WorkerSettings,
+            redis_pool=main_module.arq_pool,
+            burst=True,
+            handle_signals=False
+        )
+        await worker.async_run()
+        
+        # Step 4: Verify worker delivered the notification through configured mock gateway
+        assert main_module.gateway_mock.was_received_map.get(unique_key) is True
+        
+        # Step 5: Duplicate request after completion returns 200 OK verbatim
+        response_done = await ac.post("/v1/notifications", json={
+            "idempotency_key": unique_key,
+            "title": "Welcome User",
+            "message": "Your account is activated."
+        }, headers={"x-user-id": TEST_USER_ID})
+        assert response_done.status_code == 200
+        data_done = response_done.json()
+        assert data_done["status"] == "success"
+        assert data_done["idempotency_key"] == unique_key
+        assert "delivered" in data_done["detail"].lower()

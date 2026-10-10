@@ -2,7 +2,13 @@ import os
 import sys
 import time
 import logging
+import asyncio
+from pathlib import Path
 from urllib.parse import urlparse
+from dotenv import load_dotenv
+
+# Ensure environment variables are loaded immediately upon import
+load_dotenv()
 
 from redis.exceptions import ResponseError, WatchError
 from arq.connections import RedisSettings, create_pool
@@ -10,6 +16,10 @@ from arq.constants import in_progress_key_prefix
 from arq.utils import timestamp_ms
 from arq.worker import Worker, logger as arq_logger
 import app.main as main_module
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+SCRATCH_DIR = Path(os.getenv("SCRATCH_DIR", str(BASE_DIR / "scratch")))
+CONCURRENT_JOBS_LOG = SCRATCH_DIR / "concurrent_jobs.log"
 
 LUA_BATCH_CLAIM_SCRIPT = """
 local queue = KEYS[1]
@@ -33,31 +43,44 @@ end
 return claimed
 """
 
-import asyncio
-
 _concurrency_sampler_task = None
 _stop_concurrency_sampler = None
 
 async def _sample_concurrency_loop():
-    log_path = "c:/Users/lithe/Downloads/Distributed Notification Engine/scratch/concurrent_jobs.log"
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    with open(log_path, "w") as f:
-        f.write("elapsed_s,concurrent_jobs\n")
-    t0 = time.monotonic()
-    while _stop_concurrency_sampler and not _stop_concurrency_sampler.is_set():
-        elapsed = time.monotonic() - t0
-        cnt = getattr(main_module, "_current_concurrent_jobs", 0)
-        with open(log_path, "a") as f:
-            f.write(f"{elapsed:.2f},{cnt}\n")
-        try:
-            await asyncio.sleep(0.5)
-        except asyncio.CancelledError:
-            break
+    try:
+        CONCURRENT_JOBS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONCURRENT_JOBS_LOG, "w") as f:
+            f.write("elapsed_s,concurrent_jobs\n")
+        t0 = time.monotonic()
+        while _stop_concurrency_sampler and not _stop_concurrency_sampler.is_set():
+            elapsed = time.monotonic() - t0
+            cnt = getattr(main_module, "_current_concurrent_jobs", 0)
+            try:
+                with open(CONCURRENT_JOBS_LOG, "a") as f:
+                    f.write(f"{elapsed:.2f},{cnt}\n")
+            except Exception:
+                pass
+            try:
+                await asyncio.sleep(0.5)
+            except asyncio.CancelledError:
+                break
+    except Exception as e:
+        arq_logger.debug("Concurrency sampler loop ended: %s", e)
 
 async def startup(ctx):
     global _concurrency_sampler_task, _stop_concurrency_sampler
     main_module.arq_pool = ctx['redis']
     main_module.redis = ctx['redis']
+    
+    # Initialize Postgres db_pool for DLQ access if not already present
+    import asyncpg
+    if main_module.db_pool is None:
+        db_url = main_module.get_database_url()
+        try:
+            main_module.db_pool = await asyncpg.create_pool(db_url)
+        except Exception as e:
+            arq_logger.warning("Could not initialize db_pool on worker startup: %s", e)
+            
     _stop_concurrency_sampler = asyncio.Event()
     _concurrency_sampler_task = asyncio.create_task(_sample_concurrency_loop())
     print("[Worker] Startup completed. Global arq_pool, redis, and concurrency sampler initialized.")
@@ -73,6 +96,11 @@ async def shutdown(ctx):
             main_module._job_exec_log_file.flush()
             main_module._job_exec_log_file.close()
             main_module._job_exec_log_file = None
+        except Exception:
+            pass
+    if getattr(main_module, "db_pool", None) is not None:
+        try:
+            await main_module.db_pool.close()
         except Exception:
             pass
     print("[Worker] Shutdown completed.")
@@ -162,6 +190,7 @@ class WorkerSettings:
 
 
 def run_worker():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     parsed = urlparse(redis_url)
     settings = RedisSettings(
